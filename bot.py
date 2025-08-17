@@ -3,7 +3,7 @@ import sqlite3
 import os
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-import requests
+import aiohttp
 from bs4 import BeautifulSoup
 
 # Токен из переменной окружения
@@ -43,26 +43,50 @@ keyboard = ReplyKeyboardMarkup(
 # Состояние подписки
 user_subscribed = {}
 
+# --- Парсер OLX ---
 async def fetch_ads(category):
     url = URLS[category]
-    r = requests.get(url)
-    soup = BeautifulSoup(r.text, "html.parser")
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     ads = []
-    for item in soup.select("div.offer-wrapper"):
-        try:
-            title = item.select_one("strong").text.strip()
-            link = item.select_one("a")["href"]
-            price_text = item.select_one(".price").text.strip().replace("zł", "").replace(" ", "")
-            price = int(price_text)
-            ad_id = link.split("/")[-1]
-            if price <= MAX_PRICE[category]:
-                ads.append((ad_id, title, link, price))
-        except:
-            continue
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as response:
+            html = await response.text()
+            soup = BeautifulSoup(html, "html.parser")
+
+            for link_tag in soup.select("a[href*='/oferta/']"):
+                try:
+                    link = link_tag["href"]
+
+                    # Заголовок
+                    title_tag = link_tag.select_one("h6")
+                    if not title_tag:
+                        title_tag = link_tag.get("title")
+                    if not title_tag:
+                        continue
+                    title = title_tag.text.strip() if hasattr(title_tag, "text") else title_tag.strip()
+
+                    # Цена
+                    price_tag = link_tag.select_one("p")
+                    if not price_tag:
+                        continue
+                    price_text = price_tag.text.strip().replace("zł", "").replace(" ", "").replace(",", "")
+                    price = int(''.join(filter(str.isdigit, price_text)))
+
+                    if price > MAX_PRICE[category]:
+                        continue
+
+                    ad_id = link.split("/")[-2]  # ID объявления
+                    ads.append((ad_id, title, link, price))
+                except:
+                    continue
     return ads
 
+# --- Отправка новых объявлений (с сортировкой по цене) ---
 async def send_new_ads(user_id, category):
     ads = await fetch_ads(category)
+    # Сортировка по цене от меньшей к большей
+    ads.sort(key=lambda x: x[3])
     for ad_id, title, link, price in ads:
         c.execute("SELECT 1 FROM sent_ads WHERE ad_id=?", (ad_id,))
         if not c.fetchone():
@@ -70,14 +94,15 @@ async def send_new_ads(user_id, category):
             c.execute("INSERT INTO sent_ads (ad_id) VALUES (?)", (ad_id,))
             conn.commit()
 
+# --- Проверка новых объявлений каждые 60 секунд ---
 async def check_ads():
     while True:
         for user_id, categories in user_subscribed.items():
             for category in categories:
                 await send_new_ads(user_id, category)
-        await asyncio.sleep(60)  # Проверка каждую минуту
+        await asyncio.sleep(60)
 
-# Хендлер /start
+# --- Хендлер /start ---
 async def start_handler(message: types.Message):
     user_id = message.from_user.id
     user_subscribed[user_id] = []
@@ -85,7 +110,7 @@ async def start_handler(message: types.Message):
 
 dp.message.register(start_handler, F.text == "/start")
 
-# Хендлер кнопок
+# --- Хендлер кнопок ---
 async def button_handler(message: types.Message):
     user_id = message.from_user.id
     text = message.text
@@ -113,7 +138,7 @@ async def button_handler(message: types.Message):
 
 dp.message.register(button_handler)
 
-# Запуск бота
+# --- Запуск бота ---
 async def main():
     asyncio.create_task(check_ads())
     await dp.start_polling(bot)
