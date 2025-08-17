@@ -1,12 +1,12 @@
 import asyncio
+import sqlite3
 import os
-import aiosqlite
-import aiohttp
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+import requests
 from bs4 import BeautifulSoup
 
-# Получаем токен из переменной окружения
+# Токен из переменной окружения
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise ValueError("Токен не найден! Установи переменную окружения TOKEN.")
@@ -25,6 +25,12 @@ MAX_PRICE = {
     "электро": 1300
 }
 
+# База данных
+conn = sqlite3.connect("ads.db")
+c = conn.cursor()
+c.execute("CREATE TABLE IF NOT EXISTS sent_ads (ad_id TEXT PRIMARY KEY)")
+conn.commit()
+
 # Клавиатура
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -34,48 +40,20 @@ keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# Состояние подписки пользователей
+# Состояние подписки
 user_subscribed = {}
 
-# ---------------------------
-# Асинхронная работа с базой
-# ---------------------------
-DB_PATH = "ads.db"
-
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS sent_ads (ad_id TEXT PRIMARY KEY)")
-        await db.commit()
-
-async def ad_exists(ad_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT 1 FROM sent_ads WHERE ad_id=?", (ad_id,)) as cursor:
-            return await cursor.fetchone() is not None
-
-async def save_ad(ad_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO sent_ads (ad_id) VALUES (?)", (ad_id,))
-        await db.commit()
-
-# ---------------------------
-# Получение объявлений
-# ---------------------------
 async def fetch_ads(category):
     url = URLS[category]
+    r = requests.get(url)
+    soup = BeautifulSoup(r.text, "html.parser")
     ads = []
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as r:
-            text = await r.text()
-    soup = BeautifulSoup(text, "html.parser")
     for item in soup.select("div.offer-wrapper"):
         try:
             title = item.select_one("strong").text.strip()
             link = item.select_one("a")["href"]
             price_text = item.select_one(".price").text.strip().replace("zł", "").replace(" ", "")
-            try:
-                price = int(price_text)
-            except ValueError:
-                continue  # пропускаем объявления без цены
+            price = int(price_text)
             ad_id = link.split("/")[-1]
             if price <= MAX_PRICE[category]:
                 ads.append((ad_id, title, link, price))
@@ -86,13 +64,12 @@ async def fetch_ads(category):
 async def send_new_ads(user_id, category):
     ads = await fetch_ads(category)
     for ad_id, title, link, price in ads:
-        if not await ad_exists(ad_id):
+        c.execute("SELECT 1 FROM sent_ads WHERE ad_id=?", (ad_id,))
+        if not c.fetchone():
             await bot.send_message(user_id, f"{title}\n{price} zł\n{link}")
-            await save_ad(ad_id)
+            c.execute("INSERT INTO sent_ads (ad_id) VALUES (?)", (ad_id,))
+            conn.commit()
 
-# ---------------------------
-# Проверка объявлений в фоне
-# ---------------------------
 async def check_ads():
     while True:
         for user_id, categories in user_subscribed.items():
@@ -100,17 +77,16 @@ async def check_ads():
                 await send_new_ads(user_id, category)
         await asyncio.sleep(60)  # Проверка каждую минуту
 
-# ---------------------------
-# Хендлеры
-# ---------------------------
-@dp.message_handler(commands=["start"])
-async def start(message: types.Message):
+# Хендлер /start
+async def start_handler(message: types.Message):
     user_id = message.from_user.id
     user_subscribed[user_id] = []
     await message.answer("Выберите категорию:", reply_markup=keyboard)
 
-@dp.message_handler()
-async def handle_messages(message: types.Message):
+dp.message.register(start_handler, F.text == "/start")
+
+# Хендлер кнопок
+async def button_handler(message: types.Message):
     user_id = message.from_user.id
     text = message.text
 
@@ -135,15 +111,13 @@ async def handle_messages(message: types.Message):
                 del user_subscribed[user_id]
             await message.answer("Подписка полностью остановлена.")
 
-# ---------------------------
+dp.message.register(button_handler)
+
 # Запуск бота
-# ---------------------------
 async def main():
-    await init_db()
     asyncio.create_task(check_ads())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 
